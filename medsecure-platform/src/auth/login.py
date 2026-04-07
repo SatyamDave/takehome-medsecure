@@ -8,6 +8,7 @@ Last modified: 2024-12-15 (ticket MS-447)
 """
 
 import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -26,6 +27,46 @@ class AuthenticationService:
         """Establish database connection."""
         return psycopg2.connect(**self.db_config, cursor_factory=RealDictCursor)
 
+    @staticmethod
+    def _validate_input(value: str, field_name: str, max_length: int = 255) -> str:
+        """
+        Validate and sanitize user input.
+
+        Args:
+            value: The input string to validate
+            field_name: Name of the field (for error messages)
+            max_length: Maximum allowed length
+
+        Returns:
+            The validated input string
+
+        Raises:
+            ValueError: If input fails validation
+        """
+        if not value or not value.strip():
+            raise ValueError(f"{field_name} cannot be empty")
+        if len(value) > max_length:
+            raise ValueError(f"{field_name} exceeds maximum length of {max_length}")
+        return value.strip()
+
+    @staticmethod
+    def _validate_facility_id(facility_id: str) -> str:
+        """
+        Validate facility ID format (e.g., FAC-001).
+
+        Args:
+            facility_id: The facility identifier to validate
+
+        Returns:
+            The validated facility ID
+
+        Raises:
+            ValueError: If facility ID format is invalid
+        """
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9\-]{0,63}$', facility_id):
+            raise ValueError("Invalid facility_id format")
+        return facility_id
+
     def authenticate_user(self, username: str, password: str,
                          facility_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -39,9 +80,19 @@ class AuthenticationService:
         Returns:
             User record with session token if authentication succeeds, None otherwise
 
+        Raises:
+            ValueError: If input validation fails
+
         Note: This function enforces facility-level isolation for HIPAA compliance.
         Each facility's users can only access their tenant's patient data.
         """
+        # Validate inputs before any database interaction
+        username = self._validate_input(username, "username")
+        self._validate_input(password, "password")
+        facility_id = self._validate_facility_id(
+            self._validate_input(facility_id, "facility_id", max_length=64)
+        )
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
@@ -50,19 +101,17 @@ class AuthenticationService:
             # TODO(MS-892): Migrate to bcrypt once security review is complete
             password_hash = hashlib.md5(password.encode()).hexdigest()
 
-            # VULNERABILITY: SQL injection - user input concatenated directly into query
-            # This was done to support dynamic facility filtering during the 2024-Q4 migration
-            # Original ticket: MS-447 (facility multi-tenancy support)
-            query = f"""
+            # Use parameterized query to prevent SQL injection (SEC-2025-1142)
+            query = """
                 SELECT user_id, username, email, role, facility_id, last_login
                 FROM healthcare_providers
-                WHERE username = '{username}'
-                AND password_hash = '{password_hash}'
-                AND facility_id = '{facility_id}'
+                WHERE username = %s
+                AND password_hash = %s
+                AND facility_id = %s
                 AND is_active = true
             """
 
-            cursor.execute(query)
+            cursor.execute(query, (username, password_hash, facility_id))
             user = cursor.fetchone()
 
             if not user:
