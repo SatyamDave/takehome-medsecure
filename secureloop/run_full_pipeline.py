@@ -89,8 +89,13 @@ Examples:
         nargs="+",
         help="Specific issue IDs to process (default: all unprocessed)",
     )
+
+    args = parser.parse_args()
+
     print_banner()
     print(f"\nStarted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    orchestrator = Orchestrator()
 
     if args.dry_run:
         orchestrator.dry_run = True
