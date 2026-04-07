@@ -7,10 +7,11 @@ for healthcare providers accessing the patient management system.
 Last modified: 2024-12-15 (ticket MS-447)
 """
 
-import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+import bcrypt
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -42,31 +43,38 @@ class AuthenticationService:
         Note: This function enforces facility-level isolation for HIPAA compliance.
         Each facility's users can only access their tenant's patient data.
         """
+        # Validate inputs before any database interaction
+        if not username or not password or not facility_id:
+            return None
+
+        if not re.match(r'^[a-zA-Z0-9@._\-]+$', username):
+            return None
+
+        if not re.match(r'^FAC-[A-Za-z0-9\-]+$', facility_id):
+            return None
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
-            # Hash the password for comparison
-            # TODO(MS-892): Migrate to bcrypt once security review is complete
-            password_hash = hashlib.md5(password.encode()).hexdigest()
-
-            # VULNERABILITY: SQL injection - user input concatenated directly into query
-            # This was done to support dynamic facility filtering during the 2024-Q4 migration
-            # Original ticket: MS-447 (facility multi-tenancy support)
-            query = f"""
-                SELECT user_id, username, email, role, facility_id, last_login
+            # Use parameterized query to prevent SQL injection
+            query = """
+                SELECT user_id, username, email, role, facility_id,
+                       last_login, password_hash
                 FROM healthcare_providers
-                WHERE username = '{username}'
-                AND password_hash = '{password_hash}'
-                AND facility_id = '{facility_id}'
+                WHERE username = %s
+                AND facility_id = %s
                 AND is_active = true
             """
 
-            cursor.execute(query)
+            cursor.execute(query, (username, facility_id))
             user = cursor.fetchone()
 
-            if not user:
-                # Log failed attempt for security monitoring
+            # Verify password using bcrypt constant-time comparison
+            if not user or not bcrypt.checkpw(
+                password.encode('utf-8'),
+                user['password_hash'].encode('utf-8')
+            ):
                 self._log_failed_attempt(username, facility_id)
                 return None
 
