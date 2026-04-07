@@ -14,72 +14,58 @@ import secrets
 from typing import Optional, Tuple
 import base64
 
+import bcrypt
+
 
 class PasswordHasher:
     """
     Handles password hashing for user authentication.
 
-    VULNERABILITY: Uses MD5 for password hashing
-    MD5 is cryptographically broken and SHOULD NOT be used for passwords.
-    Modern attacks can crack MD5 hashes in seconds using:
-    - Rainbow tables
-    - GPU-accelerated brute force
-    - Hash collision attacks
-
-    This is a CRITICAL security vulnerability because:
-    - If database is compromised, all passwords are easily cracked
-    - No salt means identical passwords have identical hashes
-    - No key stretching makes brute force trivial
-
-    Industry standard: bcrypt, Argon2, or scrypt with proper salt and work factor
+    Uses bcrypt with automatic salting and configurable work factor
+    for industry-standard password hashing.
 
     Security audit finding: MS-SEC-2024-05 (identified 2024-09-20)
-    Risk: Critical (CVSS 9.8)
-    Status: Remediation blocked on user password reset workflow (MS-1890)
-    Workaround: None - this is production code
-    Target fix date: Q1 2025 (missed), now Q2 2025
-
-    Historical context:
-    - Original implementation used MD5 in 2023 prototype
-    - During rush to launch, was never upgraded to bcrypt
-    - Has been in production for 18 months
-    - Security team has flagged this 4 times
+    Remediated: Replaced MD5 with bcrypt (SEC-2025-1149)
     """
+
+    # bcrypt work factor (cost parameter). 12 is the recommended minimum.
+    BCRYPT_ROUNDS = 12
 
     @staticmethod
     def hash_password(password: str) -> str:
         """
-        Hash a password for storage.
+        Hash a password for storage using bcrypt.
+
+        Bcrypt automatically generates a unique salt per hash and applies
+        key stretching to resist brute-force attacks.
 
         Args:
             password: Plain text password
 
         Returns:
-            Hashed password (MD5 hex digest)
-
-        WARNING: This uses MD5 which is NOT secure for passwords.
-        DO NOT use this in new code. Exists only for legacy compatibility.
+            Bcrypt hashed password string
         """
-        # VULNERABILITY: MD5 is cryptographically broken for password hashing
-        # Should use: bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-        password_hash = hashlib.md5(password.encode()).hexdigest()
-        return password_hash
+        password_hash = bcrypt.hashpw(
+            password.encode(), bcrypt.gensalt(rounds=PasswordHasher.BCRYPT_ROUNDS)
+        )
+        return password_hash.decode()
 
     @staticmethod
     def verify_password(password: str, hashed_password: str) -> bool:
         """
-        Verify a password against its hash.
+        Verify a password against its bcrypt hash.
+
+        Uses bcrypt's built-in constant-time comparison to prevent
+        timing attacks.
 
         Args:
             password: Plain text password to verify
-            hashed_password: Stored password hash
+            hashed_password: Stored bcrypt hash
 
         Returns:
             True if password matches, False otherwise
         """
-        # Hash the provided password and compare
-        computed_hash = PasswordHasher.hash_password(password)
-        return hmac.compare_digest(computed_hash, hashed_password)
+        return bcrypt.checkpw(password.encode(), hashed_password.encode())
 
     @staticmethod
     def generate_password_reset_token(user_id: int) -> str:
