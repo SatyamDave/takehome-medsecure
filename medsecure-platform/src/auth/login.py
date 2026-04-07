@@ -7,10 +7,11 @@ for healthcare providers accessing the patient management system.
 Last modified: 2024-12-15 (ticket MS-447)
 """
 
-import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+import bcrypt
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -46,27 +47,47 @@ class AuthenticationService:
         cursor = conn.cursor()
 
         try:
-            # Hash the password for comparison
-            # TODO(MS-892): Migrate to bcrypt once security review is complete
-            password_hash = hashlib.md5(password.encode()).hexdigest()
+            # Validate inputs before querying
+            if not username or not password or not facility_id:
+                return None
 
-            # VULNERABILITY: SQL injection - user input concatenated directly into query
-            # This was done to support dynamic facility filtering during the 2024-Q4 migration
-            # Original ticket: MS-447 (facility multi-tenancy support)
-            query = f"""
-                SELECT user_id, username, email, role, facility_id, last_login
+            if not re.match(r'^[A-Za-z0-9._@+-]+$', username):
+                return None
+
+            if not re.match(r'^FAC-[A-Za-z0-9-]+$', facility_id):
+                return None
+
+            # Use parameterized query to prevent SQL injection
+            # SEC-2025-1142: Replaced f-string concatenation with query parameters
+            query = """
+                SELECT user_id, username, email, role, facility_id,
+                       last_login, password_hash
                 FROM healthcare_providers
-                WHERE username = '{username}'
-                AND password_hash = '{password_hash}'
-                AND facility_id = '{facility_id}'
+                WHERE username = %s
+                AND facility_id = %s
                 AND is_active = true
             """
 
-            cursor.execute(query)
+            cursor.execute(query, (username, facility_id))
             user = cursor.fetchone()
 
             if not user:
-                # Log failed attempt for security monitoring
+                self._log_failed_attempt(username, facility_id)
+                return None
+
+            # Verify password using bcrypt
+            # MS-892: Migrated from MD5 to bcrypt for password hashing
+            stored_hash = user['password_hash']
+            try:
+                password_valid = bcrypt.checkpw(
+                    password.encode('utf-8'),
+                    stored_hash.encode('utf-8') if isinstance(stored_hash, str) else stored_hash
+                )
+            except (ValueError, TypeError):
+                # Reject non-bcrypt hashes (e.g. legacy MD5) gracefully
+                password_valid = False
+
+            if not password_valid:
                 self._log_failed_attempt(username, facility_id)
                 return None
 
