@@ -1,0 +1,10 @@
+# SecureLoop Dependencies
+
+# HTTP client for API calls
+requests==2.31.0
+
+# JSON handling (built-in, but listed for clarity)
+# json (included in Python stdlib)
+
+# For Slack notifications
+# slack-sdk==3.21.0  # Optional: uncomment if using Slack SDK
