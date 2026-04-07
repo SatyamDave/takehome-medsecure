@@ -14,9 +14,11 @@ SecureLoop closes the loop between security findings and engineering fixes:
 
 1. **CodeQL** finds vulnerabilities → stored in `SECURITY_ISSUES.json`
 2. **Orchestrator** classifies each issue by complexity (trivial / medium / needs-human)
-3. **Devin** receives the issue → writes root-cause fix + tests → creates PR
+3. **Devin** receives the issue → writes root-cause fix + tests → creates PR (in parallel)
 4. **Slack** notifies your team at each stage
 5. **Dashboard** shows real-time metrics (MTTR, fix rate, severity breakdown)
+
+> **Note:** Issues are processed in parallel using ThreadPoolExecutor for maximum throughput.
 
 ---
 
