@@ -20,6 +20,8 @@ import json
 import os
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
@@ -108,6 +110,7 @@ class Orchestrator:
         self.state_file = state_file
         self.issues_file = issues_file
         self.prompt_generator = DevinPromptGenerator()
+        self._state_lock = threading.Lock()
 
         if not self.devin_api_key:
             logger.warning("[DEVIN] No API key - running in DRY_RUN mode")
@@ -159,7 +162,7 @@ class Orchestrator:
         )
 
     def save_state(self, state: PipelineState) -> None:
-        """Save pipeline state to file."""
+        """Save pipeline state to file (thread-safe)."""
         data = {
             "issues": state.issues,
             "sessions": [asdict(s) for s in state.sessions],
@@ -167,8 +170,9 @@ class Orchestrator:
             "metrics": state.metrics,
         }
 
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2)
+        with self._state_lock:
+            with open(self.state_file, "w") as f:
+                json.dump(data, f, indent=2)
 
         logger.info(f"State saved to {self.state_file}")
 
@@ -465,11 +469,81 @@ class Orchestrator:
 
         return session_result
 
+    def _process_single_issue_parallel(
+        self, issue: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], SessionResult]:
+        """
+        Process a single issue in parallel (sends to Devin and polls).
+
+        Returns tuple of (issue, session_result).
+        """
+        issue_id = issue["id"]
+        logger.info(f"[PARALLEL] Processing {issue_id}")
+
+        complexity = self.classify_issue(issue)
+        logger.info(f"[PARALLEL] {issue_id} classified as {complexity.value}")
+
+        if complexity == IssueComplexity.NEEDS_HUMAN:
+            self.send_slack_notification(
+                f"Issue {issue_id} requires human review: {issue['title']}",
+                severity="warning",
+            )
+            result = SessionResult(
+                session_id="needs-human",
+                issue_id=issue_id,
+                status="needs_review",
+                pr_url=None,
+                started_at=datetime.utcnow().isoformat(),
+                completed_at=datetime.utcnow().isoformat(),
+                error_message="Requires human review",
+            )
+            return (issue, result)
+
+        session_result = self.send_to_devin(issue)
+
+        if not session_result:
+            self.send_slack_notification(
+                f"Failed to initiate Devin session for {issue_id}", severity="error"
+            )
+            logger.error(f"[ERROR] Failed to create Devin session for {issue_id}")
+            result = SessionResult(
+                session_id="failed",
+                issue_id=issue_id,
+                status="failed",
+                pr_url=None,
+                started_at=datetime.utcnow().isoformat(),
+                completed_at=datetime.utcnow().isoformat(),
+                error_message="Failed to create Devin session",
+            )
+            return (issue, result)
+
+        self.send_slack_notification(
+            f"Started remediation for {issue_id}: {issue['title']}", severity="info"
+        )
+
+        status_result = self.poll_session(session_result.session_id)
+
+        session_result.status = status_result.get("status", "unknown")
+        session_result.completed_at = datetime.utcnow().isoformat()
+        session_result.pr_url = status_result.get("pr_url")
+
+        if session_result.status == "completed":
+            self.send_slack_notification(
+                f"PR opened for {issue_id}: {session_result.pr_url}", severity="info"
+            )
+        else:
+            self.send_slack_notification(
+                f"Remediation failed for {issue_id}: {session_result.status}",
+                severity="error",
+            )
+
+        return (issue, session_result)
+
     def run_pipeline(
         self, issue_ids: Optional[List[str]] = None, limit: Optional[int] = None
     ) -> PipelineState:
         """
-        Run the full remediation pipeline.
+        Run the full remediation pipeline in PARALLEL.
 
         Args:
             issue_ids: Specific issue IDs to process (None = all open issues)
@@ -478,15 +552,11 @@ class Orchestrator:
         Returns:
             Final pipeline state
         """
-        logger.info("Starting SecureLoop pipeline")
+        logger.info("Starting SecureLoop pipeline (PARALLEL mode)")
 
-        # Load current state
         state = self.load_state()
-
-        # Load issues
         issues = self.load_issues()
 
-        # Filter to unprocessed issues if not processing specific ones
         if issue_ids:
             issues_to_process = [i for i in issues if i["id"] in issue_ids]
         else:
@@ -496,19 +566,31 @@ class Orchestrator:
         if limit:
             issues_to_process = issues_to_process[:limit]
 
-        logger.info(f"Processing {len(issues_to_process)} issues")
+        logger.info(f"Processing {len(issues_to_process)} issues in parallel")
 
-        # Process each issue
-        for issue in issues_to_process:
-            result = self.process_issue(issue)
-            state.sessions.append(result)
-            state.issues.append(issue)
+        if not issues_to_process:
+            logger.info("No issues to process")
+            return state
 
-            # Update metrics
-            state.metrics = self._calculate_metrics(issues, state.sessions)
+        max_workers = min(len(issues_to_process), 10)
 
-            # Save state after each issue
-            self.save_state(state)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._process_single_issue_parallel, issue): issue
+                for issue in issues_to_process
+            }
+
+            for future in as_completed(futures):
+                issue, result = future.result()
+                state.sessions.append(result)
+                state.issues.append(issue)
+                state.metrics = self._calculate_metrics(issues, state.sessions)
+                self.save_state(state)
+
+                logger.info(
+                    f"[COMPLETED] {result.issue_id} -> {result.status} "
+                    f"{'(PR: ' + result.pr_url + ')' if result.pr_url else ''}"
+                )
 
         state.last_updated = datetime.utcnow().isoformat()
         self.save_state(state)
