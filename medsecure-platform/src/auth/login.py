@@ -7,11 +7,12 @@ for healthcare providers accessing the patient management system.
 Last modified: 2024-12-15 (ticket MS-447)
 """
 
-import hashlib
 import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+
+import bcrypt
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -59,25 +60,29 @@ class AuthenticationService:
         cursor = conn.cursor()
 
         try:
-            # Hash the password for comparison
-            # TODO(MS-892): Migrate to bcrypt once security review is complete
-            password_hash = hashlib.md5(password.encode()).hexdigest()
-
-            # Use parameterized query to prevent SQL injection (fixes SEC-2025-1142)
+            # Fetch user record by username and facility_id using parameterized query
             query = """
-                SELECT user_id, username, email, role, facility_id, last_login
+                SELECT user_id, username, email, role, facility_id,
+                       last_login, password_hash
                 FROM healthcare_providers
                 WHERE username = %s
-                AND password_hash = %s
                 AND facility_id = %s
                 AND is_active = true
             """
 
-            cursor.execute(query, (username, password_hash, facility_id))
+            cursor.execute(query, (username, facility_id))
             user = cursor.fetchone()
 
             if not user:
                 # Log failed attempt for security monitoring
+                self._log_failed_attempt(username, facility_id)
+                return None
+
+            # Verify password using bcrypt (constant-time comparison)
+            stored_hash = user['password_hash']
+            if not isinstance(stored_hash, bytes):
+                stored_hash = stored_hash.encode('utf-8')
+            if not bcrypt.checkpw(password.encode('utf-8'), stored_hash):
                 self._log_failed_attempt(username, facility_id)
                 return None
 
