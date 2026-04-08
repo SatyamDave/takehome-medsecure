@@ -9,6 +9,7 @@ Last audit: 2024-11-30 (HIPAA compliance review passed)
 """
 
 import os
+import re
 import mimetypes
 from pathlib import Path
 from typing import Optional, BinaryIO, Dict, Any
@@ -43,11 +44,31 @@ class PatientRecordService:
         # Omitted for brevity
         pass
 
+    @staticmethod
+    def _validate_patient_id(patient_id: str) -> bool:
+        """
+        Validate that patient_id is a safe MRN identifier.
+
+        Only allows alphanumeric characters, hyphens, and underscores.
+        Rejects any path separator or traversal characters.
+
+        Args:
+            patient_id: Patient MRN to validate
+
+        Returns:
+            True if patient_id is safe, False otherwise
+        """
+        if not patient_id:
+            return False
+        # MRN format: alphanumeric, hyphens, underscores only
+        return bool(re.match(r'^[a-zA-Z0-9_-]+$', patient_id))
+
     def _resolve_and_validate_path(self, patient_id: str, document_path: str) -> Optional[Path]:
         """
         Resolve and validate a document path to prevent path traversal attacks.
 
-        Ensures the resolved path stays within the patient's record directory.
+        Ensures the resolved path stays within the patient's record directory
+        and that the patient_id itself does not contain traversal sequences.
 
         Args:
             patient_id: Patient MRN (Medical Record Number)
@@ -56,6 +77,21 @@ class PatientRecordService:
         Returns:
             Validated absolute Path if safe, None if path traversal detected
         """
+        # Reject null bytes in either parameter
+        if '\x00' in patient_id or '\x00' in document_path:
+            logger.warning(
+                "Null byte detected in path parameters: "
+                f"patient_id='{patient_id}', document_path='{document_path}'"
+            )
+            return None
+
+        # Validate patient_id format to prevent traversal via patient_id
+        if not self._validate_patient_id(patient_id):
+            logger.warning(
+                f"Invalid patient_id format rejected: '{patient_id}'"
+            )
+            return None
+
         # Build the expected patient directory
         patient_dir = self.base_path / patient_id
 
@@ -63,7 +99,9 @@ class PatientRecordService:
         full_path = (patient_dir / document_path).resolve()
 
         # Ensure the resolved path is within the patient's directory
+        # AND the patient directory is within the base path
         try:
+            patient_dir.resolve().relative_to(self.base_path.resolve())
             full_path.relative_to(patient_dir.resolve())
         except ValueError:
             logger.warning(
