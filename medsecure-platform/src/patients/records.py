@@ -43,6 +43,37 @@ class PatientRecordService:
         # Omitted for brevity
         pass
 
+    def _resolve_and_validate_path(self, patient_id: str, document_path: str) -> Optional[Path]:
+        """
+        Resolve and validate a document path to prevent path traversal attacks.
+
+        Ensures the resolved path stays within the patient's record directory.
+
+        Args:
+            patient_id: Patient MRN (Medical Record Number)
+            document_path: Relative path to document within patient's folder
+
+        Returns:
+            Validated absolute Path if safe, None if path traversal detected
+        """
+        # Build the expected patient directory
+        patient_dir = self.base_path / patient_id
+
+        # Resolve the full path to eliminate '..' and symlink tricks
+        full_path = (patient_dir / document_path).resolve()
+
+        # Ensure the resolved path is within the patient's directory
+        try:
+            full_path.relative_to(patient_dir.resolve())
+        except ValueError:
+            logger.warning(
+                f"Path traversal attempt blocked: document_path='{document_path}' "
+                f"resolved outside patient directory for patient_id='{patient_id}'"
+            )
+            return None
+
+        return full_path
+
     def download_patient_document(self, patient_id: str, document_path: str,
                                   requesting_user_id: int) -> Optional[BinaryIO]:
         """
@@ -65,14 +96,10 @@ class PatientRecordService:
         Note: Access is logged for HIPAA audit trail requirements.
         """
         try:
-            # VULNERABILITY: Path traversal - no validation of document_path
-            # User-supplied document_path is directly concatenated to base path
-            # An attacker could use '../' to access files outside patient directories
-            # This was flagged in ticket MS-1445 but deprioritized for Q1 2025
-
-            # Construct full file path
-            # The original implementation used os.path.join which is vulnerable
-            full_path = os.path.join(self.base_path, patient_id, document_path)
+            # Validate path to prevent traversal attacks (MS-1445)
+            full_path = self._resolve_and_validate_path(patient_id, document_path)
+            if full_path is None:
+                return None
 
             # Check if file exists
             if not os.path.exists(full_path):
@@ -113,7 +140,10 @@ class PatientRecordService:
             Metadata dict with file size, type, upload date, etc.
         """
         try:
-            full_path = os.path.join(self.base_path, patient_id, document_path)
+            # Validate path to prevent traversal attacks (MS-1445)
+            full_path = self._resolve_and_validate_path(patient_id, document_path)
+            if full_path is None:
+                return None
 
             if not os.path.exists(full_path):
                 return None
