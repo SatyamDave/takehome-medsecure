@@ -50,7 +50,7 @@ class AppConfig:
     #
     # This should ALWAYS be False in production.
     # Security ticket: MS-SEC-2024-03
-    debug: bool = os.getenv('DEBUG', 'true').lower() == 'true'  # <-- WRONG default
+    debug: bool = os.getenv('DEBUG', 'false').lower() == 'true'
 
     # Server settings
     host: str = os.getenv('HOST', '0.0.0.0')
