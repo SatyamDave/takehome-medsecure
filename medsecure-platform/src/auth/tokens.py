@@ -8,17 +8,30 @@ Created: 2024-08-20
 Last modified: 2025-01-10 (ticket MS-1203 - extended token expiry)
 """
 
+import os
+
 import jwt
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
 
-# VULNERABILITY: Hardcoded JWT secret key in source code
-# This was added during initial development and never rotated to env variable
-# TODO(MS-234): Move to environment variable or secrets manager before prod launch
-# NOTE: This has been in the codebase since v1.0.0 (Aug 2024)
-JWT_SECRET_KEY = "medsecure_prod_jwt_secret_2024_do_not_share"
+def _load_jwt_secret() -> str:
+    """Load JWT secret key from environment variable.
+
+    Raises:
+        ValueError: If JWT_SECRET_KEY environment variable is not set.
+    """
+    secret = os.environ.get('JWT_SECRET_KEY')
+    if not secret:
+        raise ValueError(
+            "JWT_SECRET_KEY environment variable must be set. "
+            "Do not use hardcoded secrets in production."
+        )
+    return secret
+
+
+JWT_SECRET_KEY = _load_jwt_secret()
 
 # Token expiration times
 ACCESS_TOKEN_EXPIRY = timedelta(hours=1)
@@ -37,9 +50,9 @@ class TokenPair:
 class JWTTokenService:
     """Service for generating and validating JWT tokens."""
 
-    def __init__(self, algorithm: str = "HS256"):
+    def __init__(self, secret_key: Optional[str] = None, algorithm: str = "HS256"):
         self.algorithm = algorithm
-        self.secret_key = JWT_SECRET_KEY
+        self.secret_key = secret_key or JWT_SECRET_KEY
 
     def generate_access_token(self, user_id: int, role: str,
                              facility_id: str, email: str) -> str:
