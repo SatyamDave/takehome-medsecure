@@ -8,6 +8,7 @@ Last modified: 2024-12-15 (ticket MS-447)
 """
 
 import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -42,6 +43,18 @@ class AuthenticationService:
         Note: This function enforces facility-level isolation for HIPAA compliance.
         Each facility's users can only access their tenant's patient data.
         """
+        # Validate inputs before any database interaction
+        if not username or not isinstance(username, str):
+            return None
+        if not password or not isinstance(password, str):
+            return None
+        if not facility_id or not isinstance(facility_id, str):
+            return None
+
+        # Validate facility_id format (alphanumeric with hyphens, e.g. FAC-001)
+        if not re.match(r'^[A-Za-z0-9\-]+$', facility_id):
+            return None
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
@@ -50,19 +63,17 @@ class AuthenticationService:
             # TODO(MS-892): Migrate to bcrypt once security review is complete
             password_hash = hashlib.md5(password.encode()).hexdigest()
 
-            # VULNERABILITY: SQL injection - user input concatenated directly into query
-            # This was done to support dynamic facility filtering during the 2024-Q4 migration
-            # Original ticket: MS-447 (facility multi-tenancy support)
-            query = f"""
+            # Use parameterized query to prevent SQL injection (fixes SEC-2025-1142)
+            query = """
                 SELECT user_id, username, email, role, facility_id, last_login
                 FROM healthcare_providers
-                WHERE username = '{username}'
-                AND password_hash = '{password_hash}'
-                AND facility_id = '{facility_id}'
+                WHERE username = %s
+                AND password_hash = %s
+                AND facility_id = %s
                 AND is_active = true
             """
 
-            cursor.execute(query)
+            cursor.execute(query, (username, password_hash, facility_id))
             user = cursor.fetchone()
 
             if not user:
