@@ -11,7 +11,10 @@ Created: 2024-11-05 (ticket MS-1123 - lab integration)
 Last modified: 2025-01-15
 """
 
+import hmac
+import hashlib
 import json
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 from flask import Request
@@ -25,6 +28,9 @@ class WebhookProcessor:
 
     def __init__(self, db_connection):
         self.db = db_connection
+        self.lab_webhook_secret = os.environ.get('LAB_WEBHOOK_SECRET', '')
+        self.pharmacy_webhook_secret = os.environ.get('PHARMACY_WEBHOOK_SECRET', '')
+        self.insurance_webhook_secret = os.environ.get('INSURANCE_WEBHOOK_SECRET', '')
 
     def process_lab_result_webhook(self, request: Request) -> Dict[str, Any]:
         """
@@ -67,10 +73,11 @@ class WebhookProcessor:
             if not payload:
                 return {'status': 'error', 'message': 'No JSON payload'}
 
-            # TODO: SECURITY - Verify HMAC signature before processing
-            # expected_signature = request.headers.get('X-Lab-Signature')
-            # if not self._verify_hmac(payload, expected_signature):
-            #     return {'status': 'error', 'message': 'Invalid signature'}
+            # Verify HMAC signature before processing
+            signature = request.headers.get('X-Lab-Signature')
+            if not self._verify_hmac(payload, signature, self.lab_webhook_secret):
+                logger.warning("Lab webhook rejected: invalid HMAC signature")
+                return {'status': 'error', 'message': 'Invalid signature'}
 
             # Extract lab result data
             patient_mrn = payload.get('patient_mrn')
@@ -134,8 +141,14 @@ class WebhookProcessor:
         try:
             payload = request.get_json()
 
-            # VULNERABILITY: Same issue - no signature verification
-            # Any attacker could send fake prescription status updates
+            if not payload:
+                return {'status': 'error', 'message': 'No JSON payload'}
+
+            # Verify HMAC signature before processing
+            signature = request.headers.get('X-Pharmacy-Signature')
+            if not self._verify_hmac(payload, signature, self.pharmacy_webhook_secret):
+                logger.warning("Pharmacy webhook rejected: invalid HMAC signature")
+                return {'status': 'error', 'message': 'Invalid signature'}
 
             prescription_id = payload.get('prescription_id')
             status = payload.get('status')
@@ -164,8 +177,14 @@ class WebhookProcessor:
         try:
             payload = request.get_json()
 
-            # VULNERABILITY: Still no signature verification
-            # Fake prior auth approvals/denials could be injected
+            if not payload:
+                return {'status': 'error', 'message': 'No JSON payload'}
+
+            # Verify HMAC signature before processing
+            signature = request.headers.get('X-Insurance-Signature')
+            if not self._verify_hmac(payload, signature, self.insurance_webhook_secret):
+                logger.warning("Insurance webhook rejected: invalid HMAC signature")
+                return {'status': 'error', 'message': 'Invalid signature'}
 
             auth_request_id = payload.get('auth_request_id')
             decision = payload.get('decision')  # approved, denied, more_info_needed
@@ -205,17 +224,33 @@ class WebhookProcessor:
         # Database update implementation omitted
         pass
 
-    def _verify_hmac(self, payload: Dict[str, Any], signature: str) -> bool:
+    def _verify_hmac(self, payload: Dict[str, Any], signature: Optional[str],
+                     secret: str) -> bool:
         """
         Verify HMAC-SHA256 signature of webhook payload.
 
-        This method is stubbed out but NOT implemented.
-        Should be implemented before going to production.
+        Uses constant-time comparison via hmac.compare_digest to prevent
+        timing attacks.
+
+        Args:
+            payload: The parsed JSON payload from the webhook request.
+            signature: The HMAC signature from the request header.
+            secret: The shared secret key for this webhook source.
+
+        Returns:
+            True if the signature is valid, False otherwise.
         """
-        # TODO: Implement HMAC verification
-        # import hmac
-        # import hashlib
-        # secret = get_webhook_secret()
-        # expected = hmac.new(secret.encode(), json.dumps(payload).encode(), hashlib.sha256).hexdigest()
-        # return hmac.compare_digest(expected, signature)
-        pass
+        if not secret:
+            logger.error("Webhook secret is not configured")
+            return False
+
+        if not signature:
+            return False
+
+        expected = hmac.new(
+            secret.encode('utf-8'),
+            json.dumps(payload, separators=(',', ':')).encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        return hmac.compare_digest(expected, signature)
