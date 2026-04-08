@@ -13,6 +13,7 @@ from datetime import datetime
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,11 @@ class PatientSearchService:
             # ADVANCED SEARCH: Clinical criteria
             # This was added in MS-892 to support population health queries
             if 'diagnosis' in query_params or 'medication' in query_params:
-                advanced_query = self._build_advanced_query(query_params)
+                try:
+                    advanced_query = self._build_advanced_query(query_params)
+                except ValueError as e:
+                    logger.warning(f"Invalid search parameter rejected: {e}")
+                    return []
                 if advanced_query:
                     base_query.update(advanced_query)
 
@@ -105,6 +110,32 @@ class PatientSearchService:
             logger.error(f"MongoDB error during patient search: {e}")
             return []
 
+    @staticmethod
+    def _sanitize_query_value(value: Any) -> str:
+        """
+        Sanitize user input for safe use in MongoDB queries.
+
+        Prevents NoSQL injection by ensuring values are plain strings
+        and do not contain MongoDB operator patterns.
+
+        Args:
+            value: Raw user input to sanitize
+
+        Returns:
+            Sanitized string safe for use in MongoDB queries
+
+        Raises:
+            ValueError: If the input type is not a string or contains
+                        MongoDB operator patterns
+        """
+        if not isinstance(value, str):
+            raise ValueError(f"Expected string query value, got {type(value).__name__}")
+
+        if re.search(r'\$', value):
+            raise ValueError("Query value contains invalid characters")
+
+        return value
+
     def _build_advanced_query(self, query_params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Build advanced clinical search query for MongoDB.
@@ -112,25 +143,17 @@ class PatientSearchService:
         This constructs queries for the 'conditions' and 'medications' arrays
         in the patient document, supporting population health use cases.
 
-        VULNERABILITY: NoSQL injection - user input concatenated into query
-        The diagnosis and medication parameters are not sanitized before being
-        inserted into the MongoDB query. An attacker could inject operators
-        like $where, $regex, $ne to bypass query logic or cause DOS.
-
-        This was introduced in MS-892 when we added advanced search.
-        Security review ticket: MS-1556 (scheduled for Q2 2025)
+        All user-provided values are sanitized via _sanitize_query_value to
+        prevent NoSQL injection (see MS-1556).
         """
         advanced_query = {}
 
         if 'diagnosis' in query_params:
-            diagnosis = query_params['diagnosis']
-            # Directly insert user input into query - NOT SAFE
-            # This allows injection of MongoDB operators
+            diagnosis = self._sanitize_query_value(query_params['diagnosis'])
             advanced_query['conditions'] = {'$elemMatch': {'icd10_code': diagnosis}}
 
         if 'medication' in query_params:
-            medication = query_params['medication']
-            # Same issue here - user input directly in query
+            medication = self._sanitize_query_value(query_params['medication'])
             advanced_query['medications'] = {'$elemMatch': {'name': medication}}
 
         if 'age_min' in query_params:
