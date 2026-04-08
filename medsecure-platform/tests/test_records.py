@@ -141,3 +141,75 @@ class TestPatientRecordPathValidation:
             'MRN-123456', '/etc/passwd'
         )
         assert result is None
+
+    # --- Patient ID traversal attack tests (SEC-2025-1144) ---
+
+    def test_download_blocks_traversal_in_patient_id(self):
+        """Test that '../' sequences in patient_id are blocked."""
+        result = self.service.download_patient_document(
+            '../../../etc', 'passwd', requesting_user_id=42
+        )
+        assert result is None
+
+    def test_download_blocks_patient_id_with_path_separator(self):
+        """Test that patient_id containing '/' is blocked."""
+        result = self.service.download_patient_document(
+            'MRN-123456/../MRN-999999', 'labs/private.pdf', requesting_user_id=42
+        )
+        assert result is None
+
+    def test_metadata_blocks_traversal_in_patient_id(self):
+        """Test that '../' sequences in patient_id are blocked for metadata."""
+        result = self.service.get_document_metadata(
+            '../../../etc', 'passwd'
+        )
+        assert result is None
+
+    def test_validate_path_blocks_traversal_in_patient_id(self):
+        """Test that _resolve_and_validate_path rejects traversal in patient_id."""
+        result = self.service._resolve_and_validate_path(
+            '../../../etc', 'passwd'
+        )
+        assert result is None
+
+    def test_validate_path_blocks_dotdot_patient_id(self):
+        """Test that patient_id of '..' is rejected."""
+        result = self.service._resolve_and_validate_path(
+            '..', 'secret.txt'
+        )
+        assert result is None
+
+    def test_validate_path_blocks_empty_patient_id(self):
+        """Test that empty patient_id is rejected."""
+        result = self.service._resolve_and_validate_path(
+            '', 'labs/cbc.pdf'
+        )
+        assert result is None
+
+    def test_validate_path_blocks_null_byte_in_patient_id(self):
+        """Test that null bytes in patient_id are rejected."""
+        result = self.service._resolve_and_validate_path(
+            'MRN-123456\x00', 'labs/cbc.pdf'
+        )
+        assert result is None
+
+    def test_validate_path_blocks_null_byte_in_document_path(self):
+        """Test that null bytes in document_path are rejected."""
+        result = self.service._resolve_and_validate_path(
+            'MRN-123456', 'labs/cbc.pdf\x00.html'
+        )
+        assert result is None
+
+    def test_validate_patient_id_allows_valid_mrn(self):
+        """Test that valid MRN formats are accepted."""
+        assert PatientRecordService._validate_patient_id('MRN-123456') is True
+        assert PatientRecordService._validate_patient_id('PAT_001') is True
+        assert PatientRecordService._validate_patient_id('abc123') is True
+
+    def test_validate_patient_id_rejects_traversal(self):
+        """Test that traversal sequences in patient_id are rejected."""
+        assert PatientRecordService._validate_patient_id('../etc') is False
+        assert PatientRecordService._validate_patient_id('..') is False
+        assert PatientRecordService._validate_patient_id('.') is False
+        assert PatientRecordService._validate_patient_id('foo/bar') is False
+        assert PatientRecordService._validate_patient_id('') is False
