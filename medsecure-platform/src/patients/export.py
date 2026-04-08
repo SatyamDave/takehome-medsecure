@@ -8,11 +8,15 @@ Supports: CDA, FHIR R4, HL7 v2.x, custom PDF reports
 Created: 2024-10-20 (ticket MS-1034 - patient portal exports)
 """
 
+import ipaddress
+import os
 import requests
 import json
+import socket
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from io import BytesIO
+from urllib.parse import urlparse
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,12 +26,89 @@ logger = logging.getLogger(__name__)
 PDF_GENERATOR_URL = "https://pdf-service.medsecure.internal/generate"
 PDF_GENERATOR_TIMEOUT = 30  # seconds
 
+# Allowlist of approved external domains for patient data export.
+# Configurable via the EXPORT_ALLOWED_DOMAINS environment variable
+# (comma-separated list of domain names).
+# Only HTTPS URLs on these domains are permitted.
+DEFAULT_ALLOWED_EXPORT_DOMAINS = [
+    'hie.medsecure.internal',
+    'insurance-portal.medsecure.internal',
+    'referrals.medsecure.internal',
+    'research.medsecure.internal',
+]
+
+
+def _load_allowed_export_domains() -> List[str]:
+    """Load the allowed export domains from environment or use defaults."""
+    env_domains = os.getenv('EXPORT_ALLOWED_DOMAINS')
+    if env_domains:
+        return [d.strip().lower() for d in env_domains.split(',') if d.strip()]
+    return [d.lower() for d in DEFAULT_ALLOWED_EXPORT_DOMAINS]
+
+
+def validate_export_url(url: str, allowed_domains: Optional[List[str]] = None) -> bool:
+    """
+    Validate that an export URL is safe to call.
+
+    Checks:
+    1. URL scheme must be HTTPS
+    2. Hostname must be in the allowed domains list
+    3. Hostname must not resolve to a private/internal IP address
+
+    Args:
+        url: The URL to validate.
+        allowed_domains: Optional override for allowed domains list.
+
+    Returns:
+        True if the URL passes all validation checks, False otherwise.
+    """
+    if allowed_domains is None:
+        allowed_domains = _load_allowed_export_domains()
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    # Require HTTPS
+    if parsed.scheme != 'https':
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+
+    # Check hostname against allowlist
+    if hostname.lower() not in allowed_domains:
+        return False
+
+    # Resolve hostname and block private/reserved IP ranges
+    try:
+        resolved_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+        ip = ipaddress.ip_address(resolved_ip)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            logger.warning(
+                f"SECURITY: Export URL {hostname} resolves to private/reserved IP {resolved_ip}"
+            )
+            return False
+    except (socket.gaierror, ValueError):
+        # DNS resolution failure or invalid IP — allow if domain is on the
+        # allowlist, since internal DNS may not resolve from this host.
+        pass
+
+    return True
+
 
 class PatientExportService:
     """Service for exporting patient data in various formats."""
 
-    def __init__(self, pdf_service_url: str = PDF_GENERATOR_URL):
+    def __init__(self, pdf_service_url: str = PDF_GENERATOR_URL,
+                 allowed_export_domains: Optional[List[str]] = None):
         self.pdf_service_url = pdf_service_url
+        self.allowed_export_domains = (
+            allowed_export_domains if allowed_export_domains is not None
+            else _load_allowed_export_domains()
+        )
 
     def export_patient_summary_pdf(self, patient_id: str,
                                    requesting_user_id: int,
@@ -105,26 +186,27 @@ class PatientExportService:
         - Specialist referral systems
         - Research databases (de-identified)
 
-        VULNERABILITY: Server-Side Request Forgery (SSRF)
-        The export_url parameter is user-controlled and not validated.
-        An attacker could provide internal URLs to:
-        - Scan internal network (e.g., http://169.254.169.254/latest/meta-data)
-        - Access internal services not exposed to internet
-        - Exfiltrate data to attacker-controlled servers
-
-        This was flagged in security assessment MS-SEC-2024-08 but
-        remains unfixed pending architecture review in Q2 2025.
-        Original ticket: MS-1034
+        Security: The export_url is validated against an allowlist of approved
+        domains and must use HTTPS. Private/reserved IP ranges are blocked to
+        prevent SSRF attacks.  (Fix for MS-SEC-2024-08 / SEC-2025-1146)
 
         Args:
             patient_id: Patient MRN
-            export_url: URL to POST patient data to
+            export_url: URL to POST patient data to (must be HTTPS on an approved domain)
             requesting_user_id: Healthcare provider initiating export
             format: Export format (fhir, cda, hl7, json)
 
         Returns:
             True if export succeeded, False otherwise
         """
+        # Validate export URL against allowlist to prevent SSRF
+        if not validate_export_url(export_url, self.allowed_export_domains):
+            logger.warning(
+                f"SECURITY: Blocked export to disallowed URL: {export_url} "
+                f"(user={requesting_user_id}, patient={patient_id})"
+            )
+            return False
+
         try:
             # Gather patient data
             patient_data = self._gather_patient_data(patient_id)
@@ -142,11 +224,8 @@ class PatientExportService:
             else:
                 export_payload = patient_data
 
-            # VULNERABILITY: No URL validation - SSRF risk
-            # The export_url comes directly from user input without validation
-            # Should validate against allowlist of approved domains
             response = requests.post(
-                export_url,  # User-controlled, not validated!
+                export_url,
                 json=export_payload,
                 headers={'Content-Type': 'application/json'},
                 timeout=30
