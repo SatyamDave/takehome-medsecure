@@ -9,8 +9,9 @@ Last modified: 2025-01-22
 """
 
 import os
+import secrets
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -25,15 +26,28 @@ class DatabaseConfig:
     pool_timeout: int = 30
 
 
+def _require_secret(env_var: str) -> str:
+    """Require a secret from environment variables.
+
+    Raises ValueError if the variable is not set, preventing the application
+    from starting with insecure hardcoded defaults.
+    """
+    value = os.environ.get(env_var)
+    if not value:
+        raise ValueError(
+            f"{env_var} environment variable must be set. "
+            f"Application cannot start without required secrets."
+        )
+    return value
+
+
 @dataclass
 class AppConfig:
     """
     Main application configuration.
 
-    VULNERABILITIES in this file:
-    1. Debug mode enabled in production
-    2. Secrets with default values (hardcoded fallbacks)
-    3. Permissive CORS settings
+    Security-sensitive fields (secret_key, db_password, jwt_secret) are
+    required via environment variables and will raise ValueError if not set.
     """
 
     # Application settings
@@ -56,16 +70,14 @@ class AppConfig:
     host: str = os.getenv('HOST', '0.0.0.0')
     port: int = int(os.getenv('PORT', '8000'))
 
-    # VULNERABILITY: Hardcoded secret key fallback
-    # If SECRET_KEY env var is not set, falls back to hardcoded value.
-    # This is the Flask session signing key - if compromised, attacker can:
+    # Flask session signing key - if compromised, attacker can:
     # - Forge session cookies
     # - Impersonate any user
     # - Bypass authentication
     #
-    # The fallback should cause the app to FAIL, not use an insecure default.
+    # Must be set via SECRET_KEY environment variable.
     # Security ticket: MS-SEC-2024-04
-    secret_key: str = os.getenv('SECRET_KEY', 'medsecure-default-secret-change-in-prod')
+    secret_key: str = field(default_factory=lambda: _require_secret('SECRET_KEY'))
 
     # CORS settings
     # VULNERABILITY: Overly permissive CORS allows any origin
@@ -79,7 +91,7 @@ class AppConfig:
     db_port: int = int(os.getenv('DB_PORT', '5432'))
     db_name: str = os.getenv('DB_NAME', 'medsecure')
     db_user: str = os.getenv('DB_USER', 'medsecure_app')
-    db_password: str = os.getenv('DB_PASSWORD', 'changeme123')  # <-- Another default
+    db_password: str = field(default_factory=lambda: _require_secret('DB_PASSWORD'))
 
     # MongoDB settings (for patient search)
     mongo_uri: str = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
@@ -88,7 +100,7 @@ class AppConfig:
     redis_url: str = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 
     # JWT settings
-    jwt_secret: str = os.getenv('JWT_SECRET', 'jwt-secret-key-default')  # <-- Bad default
+    jwt_secret: str = field(default_factory=lambda: _require_secret('JWT_SECRET'))
     jwt_expiry_hours: int = int(os.getenv('JWT_EXPIRY_HOURS', '1'))
 
     # File storage
@@ -144,14 +156,8 @@ class AppConfig:
             if self.debug:
                 issues.append("CRITICAL: Debug mode is enabled in production")
 
-            if 'default' in self.secret_key.lower() or 'changeme' in self.secret_key.lower():
-                issues.append("CRITICAL: Using default secret key in production")
-
             if self.cors_origins == '*':
                 issues.append("WARNING: CORS allows all origins in production")
-
-            if 'changeme' in self.db_password.lower() or len(self.db_password) < 12:
-                issues.append("WARNING: Weak database password")
 
             if not self.lab_webhook_secret:
                 issues.append("WARNING: Lab webhook secret not configured")
@@ -159,16 +165,23 @@ class AppConfig:
         return issues
 
 
-# Global configuration instance
-config = AppConfig()
+def get_config() -> AppConfig:
+    """Create and validate the application configuration.
 
-# Validate on module load
-config_issues = config.validate()
-if config_issues:
-    import logging
-    logger = logging.getLogger(__name__)
-    for issue in config_issues:
-        if issue.startswith('CRITICAL'):
-            logger.critical(issue)
-        else:
-            logger.warning(issue)
+    Raises ValueError if required secret environment variables are not set.
+    """
+    cfg = AppConfig()
+    config_issues = cfg.validate()
+    if config_issues:
+        import logging
+        logger = logging.getLogger(__name__)
+        for issue in config_issues:
+            if issue.startswith('CRITICAL'):
+                logger.critical(issue)
+            else:
+                logger.warning(issue)
+    return cfg
+
+
+# Global configuration instance
+config = get_config()
